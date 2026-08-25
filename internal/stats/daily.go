@@ -489,9 +489,9 @@ func TrendBucketSQL(column string, gran Granularity) string {
 }
 
 // DailyDimension returns per-bucket, per-dimension stats grouped by the given
-// dimension field. Supported dimensions: "model" (JSON_EXTRACT $.modelID),
-// "tool" ($.tool), "project" ($.projectID). Buckets follow the same
-// ResolveGranularity rule as Daily, so both trends always share one time axis.
+// dimension field. Models and projects come from message JSON; tool calls come
+// from part JSON. Buckets follow the same ResolveGranularity rule as Daily, so
+// both trends always share one time axis.
 func DailyDimension(ctx context.Context, db *store.Store, dimension string, pq PeriodQuery, granularity ...Granularity) (DailyDimensionStats, error) {
 	path, ok := validDimensions[dimension]
 	if !ok {
@@ -525,7 +525,31 @@ func DailyDimension(ctx context.Context, db *store.Store, dimension string, pq P
 		GROUP BY day, dim
 		ORDER BY day ASC, total_cost DESC
 	`, path, bucket)
-	if dimension == "model" {
+	if dimension == "tool" {
+		// OpenCode stores tool names on part rows, not assistant messages. Use
+		// part.time_created so the daily totals have the same time basis as
+		// Tools and include calls from the live cache gap.
+		query = fmt.Sprintf(`
+			SELECT
+				%s AS day,
+				JSON_EXTRACT(p.data, '$.tool') AS dim,
+				COUNT(DISTINCT p.session_id) AS sessions,
+				COUNT(*) AS messages,
+				0.0 AS total_cost,
+				0 AS input_tokens,
+				0 AS output_tokens,
+				0 AS reasoning_tokens,
+				0 AS cache_read_tokens,
+				0 AS cache_write_tokens
+			FROM part p
+			WHERE JSON_EXTRACT(p.data, '$.type') = 'tool'
+				AND JSON_EXTRACT(p.data, '$.tool') IS NOT NULL
+				AND JSON_EXTRACT(p.data, '$.tool') != ''
+				AND p.time_created >= ? AND p.time_created < ?
+			GROUP BY day, dim
+			ORDER BY day ASC, messages DESC, dim ASC
+		`, TrendBucketSQL("p.time_created", gran))
+	} else if dimension == "model" {
 		// OpenCode may overwrite message.data.tokens after every agent step.
 		// Models treats step-finish parts as the canonical additive usage for a
 		// message and falls back to message.data.tokens only when no such part

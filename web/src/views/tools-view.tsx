@@ -1,7 +1,7 @@
-/* Tools — per-source tool usage ranking (Vael). Costs/latency are not part of
-   tool data, so those columns are omitted. No fabricated deltas or sparklines:
-   the API has no per-tool trend. Source column is only shown if entries carry
-   distinct source_id (overview view); a per-source view omits it. */
+/* Tools — per-source tool usage ranking and time-bucket breakdown (Vael).
+   Costs/latency are not part of tool data, so those columns are omitted.
+   Source column is only shown if entries carry distinct source_id (overview
+   view); a per-source view omits it. */
 import { useMemo, useState } from 'react'
 import {
   Card,
@@ -19,12 +19,13 @@ import {
   type SortSpec,
 } from '../components/vael'
 import { useDashboardContext } from '../components/layout/dashboard-context'
-import { getTools } from '../lib/api'
+import { getDailyDimension, getTools } from '../lib/api'
 import { usePeriodControls } from '../lib/use-period-controls'
 import { usePeriodResource } from '../lib/use-period-resource'
 import { getNextSortState, type SortState } from '../lib/table-sort'
-import { formatCompactInteger, formatInteger, formatPercentage, safeDivide } from '../lib/format'
-import type { ToolEntry } from '../types/api'
+import { formatCompactInteger, formatInteger, formatPercentage, formatShortDate, safeDivide } from '../lib/format'
+import { buildDailyToolRows, type DailyToolRow } from '../lib/daily-tools'
+import type { SourceID, ToolEntry } from '../types/api'
 
 type SortKey = 'tool' | 'invocations' | 'successRate' | 'failures' | 'sessions' | 'share'
 
@@ -38,6 +39,10 @@ const DEFAULT_SORT_DIRECTIONS: Record<SortKey, 'asc' | 'desc'> = {
 }
 
 const DEFAULT_SORT: SortState<SortKey> = { key: 'invocations', direction: 'desc' }
+
+function getDailyTools(period: string, signal?: AbortSignal, sourceId?: SourceID) {
+  return getDailyDimension('tool', period, signal, sourceId)
+}
 
 interface ToolRow extends ToolEntry {
   share: number
@@ -81,6 +86,11 @@ export function ToolsView() {
   const { requestRefresh } = useDashboardContext()
   const { cacheKey } = usePeriodControls()
   const { data, loading, error } = usePeriodResource(getTools, cacheKey)
+  const {
+    data: dailyData,
+    loading: dailyLoading,
+    error: dailyError,
+  } = usePeriodResource(getDailyTools, cacheKey)
   const [sortState, setSortState] = useState<SortState<SortKey> | null>(null)
   const [filter, setFilter] = useState('')
 
@@ -129,6 +139,19 @@ export function ToolsView() {
     if (!needle) return rows
     return rows.filter((row) => toolLabel(row).toLowerCase().includes(needle))
   }, [summary?.rows, filter])
+
+  const dailyRows = useMemo(() => buildDailyToolRows(dailyData?.days), [dailyData?.days])
+
+  const visibleDailyRows = useMemo(() => {
+    const needle = filter.trim().toLowerCase()
+    if (!needle) return dailyRows
+    return dailyRows.filter((row) => row.name.toLowerCase().includes(needle))
+  }, [dailyRows, filter])
+
+  const dailySummary = useMemo(() => ({
+    buckets: new Set(visibleDailyRows.map((row) => row.date)).size,
+    calls: visibleDailyRows.reduce((total, row) => total + row.calls, 0),
+  }), [visibleDailyRows])
 
   // "Most failed" leaders — the TUI surfaces these prominently and the web had
   // no equivalent, so a tool that fails constantly was only visible by sorting.
@@ -238,6 +261,57 @@ export function ToolsView() {
     return cols
   }, [])
 
+  const dailyColumns: Column<DailyToolRow>[] = useMemo(() => [
+    {
+      key: 'date',
+      header: 'Date',
+      width: 150,
+      render: (row) => (
+        <span style={{ font: '500 12px/1 var(--font-mono)', color: 'var(--fg-secondary)', fontVariantNumeric: 'tabular-nums' }}>
+          {formatShortDate(row.date)}
+        </span>
+      ),
+    },
+    {
+      key: 'tool',
+      header: 'Tool',
+      wrap: true,
+      render: (row) => (
+        <span style={{ font: '600 12px/1.3 var(--font-mono)', color: 'var(--fg-primary)' }}>
+          {row.name}
+        </span>
+      ),
+    },
+    {
+      key: 'calls',
+      header: 'Calls',
+      numeric: true,
+      width: 100,
+      render: (row) => formatInteger(row.calls),
+    },
+    {
+      key: 'sessions',
+      header: 'Sessions',
+      numeric: true,
+      width: 110,
+      render: (row) => formatInteger(row.sessions),
+    },
+    {
+      key: 'share',
+      header: 'Share of date',
+      numeric: true,
+      width: 170,
+      render: (row) => (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' }}>
+          <span style={{ width: 68, height: 6, borderRadius: 3, background: 'var(--ink-700)', overflow: 'hidden' }}>
+            <span style={{ display: 'block', width: `${Math.min(100, Math.max(row.share, row.calls > 0 ? 4 : 0))}%`, height: '100%', background: 'var(--cat-2)' }} />
+          </span>
+          <span style={{ width: 38, textAlign: 'right' }}>{formatPercentage(row.share)}</span>
+        </span>
+      ),
+    },
+  ], [])
+
   if (loading && !data) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -263,6 +337,7 @@ export function ToolsView() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       {error && <Notice tone="warning" title="Tools partially loaded">{error}</Notice>}
+      {dailyError && <Notice tone="warning" title="Daily tool usage failed to load">{dailyError}</Notice>}
 
       {/* KPI row */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 }}>
@@ -343,6 +418,39 @@ export function ToolsView() {
           )}
         </Card>
       )}
+
+      <Card
+        title={`Tool calls by ${dailyData?.granularity === 'hour' ? 'hour' : 'day'}`}
+        subtitle={`${formatInteger(dailySummary.calls)} calls across ${formatInteger(dailySummary.buckets)} ${dailyData?.granularity === 'hour' ? 'hours' : 'days'} · most recent first`}
+        action={<SearchInput value={filter} onChange={setFilter} placeholder="Filter tools…" label="Filter daily tools" width={220} />}
+        pad={0}
+      >
+        {dailyLoading && !dailyData ? (
+          <div style={{ padding: 16 }}><Skeleton width="100%" height={220} /></div>
+        ) : dailyError && !dailyData ? (
+          <ErrorState title="Daily tool usage failed to load" message={dailyError} onRetry={requestRefresh} />
+        ) : dailyRows.length === 0 ? (
+          <EmptyState
+            icon="calendar"
+            title="No daily tool calls in this range"
+            description="Adjust the time range or check that the selected source records tool events."
+          />
+        ) : visibleDailyRows.length === 0 ? (
+          <EmptyState
+            icon="search"
+            title="No daily calls match this filter"
+            description={`No tool name contains “${filter.trim()}”.`}
+            action={<Button size="sm" variant="secondary" onClick={() => setFilter('')}>Clear filter</Button>}
+          />
+        ) : (
+          <DataTable
+            columns={dailyColumns}
+            rows={visibleDailyRows}
+            rowKey={(row) => `${row.sourceId ?? ''}/${row.date}/${row.name}`}
+            dense
+          />
+        )}
+      </Card>
     </div>
   )
 }

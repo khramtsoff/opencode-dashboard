@@ -804,6 +804,70 @@ func TestDailyDimensionWithFixture(t *testing.T) {
 	}
 }
 
+func TestDailyToolDimensionReadsPartRows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	now := time.Now().UTC().Truncate(24 * time.Hour)
+	previousDay := now.Add(-24 * time.Hour)
+	b := fixture.NewBuilder().
+		AddProject(fixture.NewProject("proj-tools", "/tmp/tools").Name("tools")).
+		AddSession(fixture.NewSession("ses-tools", "proj-tools").
+			CreatedAt(previousDay).
+			UpdatedAt(now).
+			AddAssistantMessage("msg-tools-1", previousDay.Add(time.Hour), 0, "model", "provider", 0, 0, 0, 0, 0).
+			AddAssistantMessage("msg-tools-2", now.Add(time.Hour), 0, "model", "provider", 0, 0, 0, 0, 0))
+	b.AddPart(fixture.NewPart("part-bash-1", "ses-tools", `{"type":"tool","tool":"bash","state":{"status":"completed"}}`).
+		MessageID("msg-tools-1").CreatedAt(previousDay.Add(2 * time.Hour)))
+	b.AddPart(fixture.NewPart("part-bash-2", "ses-tools", `{"type":"tool","tool":"bash","state":{"status":"completed"}}`).
+		MessageID("msg-tools-1").CreatedAt(previousDay.Add(3 * time.Hour)))
+	b.AddPart(fixture.NewPart("part-read-1", "ses-tools", `{"type":"tool","tool":"read","state":{"status":"error"}}`).
+		MessageID("msg-tools-2").CreatedAt(now.Add(2 * time.Hour)))
+
+	dbPath, err := b.Build(ctx)
+	if err != nil {
+		t.Fatalf("build fixture: %v", err)
+	}
+	defer os.RemoveAll(filepath.Dir(dbPath))
+	st, err := store.Connect(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("connect fixture: %v", err)
+	}
+	defer st.Close()
+
+	daily, err := DailyDimension(ctx, st, "tool", PeriodQuery{Period: "all"}, GranularityDay)
+	if err != nil {
+		t.Fatalf("DailyDimension(tool): %v", err)
+	}
+	want := map[string]int64{
+		previousDay.Format("2006-01-02") + "/bash": 2,
+		now.Format("2006-01-02") + "/read":         1,
+	}
+	if len(daily.Days) != len(want) {
+		t.Fatalf("DailyDimension(tool) returned %d rows, want %d: %+v", len(daily.Days), len(want), daily.Days)
+	}
+	var dimensionCalls int64
+	for _, row := range daily.Days {
+		key := row.Date + "/" + row.Dimension
+		if row.Messages != want[key] {
+			t.Errorf("DailyDimension(tool) %s calls = %d, want %d", key, row.Messages, want[key])
+		}
+		dimensionCalls += row.Messages
+	}
+
+	toolStats, err := Tools(ctx, st, PeriodQuery{Period: "all"})
+	if err != nil {
+		t.Fatalf("Tools(all): %v", err)
+	}
+	var aggregateCalls int64
+	for _, tool := range toolStats.Tools {
+		aggregateCalls += tool.Invocations
+	}
+	if dimensionCalls != aggregateCalls {
+		t.Errorf("DailyDimension(tool) calls = %d, Tools invocations = %d", dimensionCalls, aggregateCalls)
+	}
+}
+
 // TestDailyDimensionInvalidDimension validates error handling for bad dimensions.
 func TestDailyDimensionInvalidDimension(t *testing.T) {
 	if testing.Short() {
