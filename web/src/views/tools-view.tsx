@@ -2,7 +2,7 @@
    Costs/latency are not part of tool data, so those columns are omitted.
    Source column is only shown if entries carry distinct source_id (overview
    view); a per-source view omits it. */
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Card,
   StatCard,
@@ -10,6 +10,7 @@ import {
   Badge,
   BarRow,
   Button,
+  Drawer,
   EmptyState,
   SearchInput,
   Skeleton,
@@ -19,13 +20,20 @@ import {
   type SortSpec,
 } from '../components/vael'
 import { useDashboardContext } from '../components/layout/dashboard-context'
-import { getDailyDimension, getTools } from '../lib/api'
+import { getDailyDimension, getMessageDetail, getMessages, getTools } from '../lib/api'
 import { usePeriodControls } from '../lib/use-period-controls'
 import { usePeriodResource } from '../lib/use-period-resource'
 import { getNextSortState, type SortState } from '../lib/table-sort'
-import { formatCompactInteger, formatInteger, formatPercentage, formatShortDate, safeDivide } from '../lib/format'
-import { buildDailyToolRows, type DailyToolRow } from '../lib/daily-tools'
-import type { SourceID, ToolEntry } from '../types/api'
+import { formatCompactInteger, formatDateTime, formatInteger, formatPercentage, formatShortDate, safeDivide } from '../lib/format'
+import {
+  buildDailyToolRows,
+  buildDailyToolTotals,
+  flattenToolCalls,
+  type DailyToolRow,
+  type DailyToolTotalRow,
+  type ToolCallRow,
+} from '../lib/daily-tools'
+import type { MessageDetail, SourceID, ToolEntry } from '../types/api'
 
 type SortKey = 'tool' | 'invocations' | 'successRate' | 'failures' | 'sessions' | 'share'
 
@@ -41,7 +49,40 @@ const DEFAULT_SORT_DIRECTIONS: Record<SortKey, 'asc' | 'desc'> = {
 const DEFAULT_SORT: SortState<SortKey> = { key: 'invocations', direction: 'desc' }
 
 function getDailyTools(period: string, signal?: AbortSignal, sourceId?: SourceID) {
-  return getDailyDimension('tool', period, signal, sourceId)
+  return getDailyDimension('tool', period, signal, sourceId, 'day')
+}
+
+const TOOL_CALL_MESSAGE_PAGE_SIZE = 100
+const TOOL_CALL_DETAIL_BATCH_SIZE = 8
+
+async function loadToolCallsForDay(date: string, signal: AbortSignal, sourceId: SourceID) {
+  const period = `from_${date}_to_${date}`
+  const messageIds: string[] = []
+  let page = 1
+
+  while (true) {
+    const result = await getMessages(period, page, TOOL_CALL_MESSAGE_PAGE_SIZE, 'time:desc', signal, sourceId)
+    messageIds.push(...result.messages.filter((message) => message.role === 'assistant').map((message) => message.id))
+    if (page * result.page_size >= result.total) break
+    page += 1
+  }
+
+  const details: MessageDetail[] = []
+  let failedDetails = 0
+  for (let i = 0; i < messageIds.length; i += TOOL_CALL_DETAIL_BATCH_SIZE) {
+    const batch = await Promise.all(messageIds.slice(i, i + TOOL_CALL_DETAIL_BATCH_SIZE).map(async (id) => {
+      try {
+        return await getMessageDetail(id, signal, sourceId)
+      } catch (caught) {
+        if (signal.aborted) throw caught
+        failedDetails += 1
+        return null
+      }
+    }))
+    details.push(...batch.filter((detail) => detail !== null))
+  }
+
+  return { calls: flattenToolCalls(details), failedDetails }
 }
 
 interface ToolRow extends ToolEntry {
@@ -83,7 +124,7 @@ function compareRows(key: SortKey, a: ToolRow, b: ToolRow): number {
 }
 
 export function ToolsView() {
-  const { requestRefresh } = useDashboardContext()
+  const { requestRefresh, selectedSourceId } = useDashboardContext()
   const { cacheKey } = usePeriodControls()
   const { data, loading, error } = usePeriodResource(getTools, cacheKey)
   const {
@@ -93,6 +134,13 @@ export function ToolsView() {
   } = usePeriodResource(getDailyTools, cacheKey)
   const [sortState, setSortState] = useState<SortState<SortKey> | null>(null)
   const [filter, setFilter] = useState('')
+  const [selectedDay, setSelectedDay] = useState<DailyToolTotalRow | null>(null)
+  const [selectedCall, setSelectedCall] = useState<ToolCallRow | null>(null)
+  const [dayCalls, setDayCalls] = useState<ToolCallRow[]>([])
+  const [dayCallsLoading, setDayCallsLoading] = useState(false)
+  const [dayCallsError, setDayCallsError] = useState<string | null>(null)
+  const [failedCallDetails, setFailedCallDetails] = useState(0)
+  const [dayCallsNonce, setDayCallsNonce] = useState(0)
 
   const summary = useMemo(() => {
     if (!data) return null
@@ -141,6 +189,7 @@ export function ToolsView() {
   }, [summary?.rows, filter])
 
   const dailyRows = useMemo(() => buildDailyToolRows(dailyData?.days), [dailyData?.days])
+  const dailyTotals = useMemo(() => buildDailyToolTotals(dailyRows), [dailyRows])
 
   const visibleDailyRows = useMemo(() => {
     const needle = filter.trim().toLowerCase()
@@ -149,9 +198,31 @@ export function ToolsView() {
   }, [dailyRows, filter])
 
   const dailySummary = useMemo(() => ({
-    buckets: new Set(visibleDailyRows.map((row) => row.date)).size,
-    calls: visibleDailyRows.reduce((total, row) => total + row.calls, 0),
-  }), [visibleDailyRows])
+    buckets: dailyTotals.length,
+    calls: dailyTotals.reduce((total, row) => total + row.calls, 0),
+  }), [dailyTotals])
+
+  useEffect(() => {
+    if (!selectedDay) return
+
+    const controller = new AbortController()
+
+    loadToolCallsForDay(selectedDay.date, controller.signal, selectedSourceId)
+      .then((result) => {
+        if (controller.signal.aborted) return
+        setDayCalls(result.calls)
+        setFailedCallDetails(result.failedDetails)
+      })
+      .catch((caught) => {
+        if (controller.signal.aborted) return
+        setDayCallsError(caught instanceof Error ? caught.message : 'Failed to load tool calls for this day')
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDayCallsLoading(false)
+      })
+
+    return () => controller.abort()
+  }, [dayCallsNonce, selectedDay, selectedSourceId])
 
   // "Most failed" leaders — the TUI surfaces these prominently and the web had
   // no equivalent, so a tool that fails constantly was only visible by sorting.
@@ -261,6 +332,42 @@ export function ToolsView() {
     return cols
   }, [])
 
+  const dailyTotalColumns: Column<DailyToolTotalRow>[] = useMemo(() => [
+    {
+      key: 'date',
+      header: 'Date',
+      render: (row) => (
+        <span style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <span style={{ font: '600 13px/1 var(--font-mono)', color: 'var(--fg-primary)', fontVariantNumeric: 'tabular-nums' }}>
+            {formatShortDate(row.date)}
+          </span>
+          <span style={{ font: '400 11px/1.2 var(--font-ui)', color: 'var(--fg-faint)' }}>Open individual calls</span>
+        </span>
+      ),
+    },
+    {
+      key: 'calls',
+      header: 'Total calls',
+      numeric: true,
+      width: 140,
+      render: (row) => <span style={{ font: '700 13px/1 var(--font-mono)', color: 'var(--fg-primary)' }}>{formatInteger(row.calls)}</span>,
+    },
+    {
+      key: 'tools',
+      header: 'Distinct tools',
+      numeric: true,
+      width: 150,
+      render: (row) => formatInteger(row.tools),
+    },
+    {
+      key: 'inspect',
+      header: '',
+      numeric: true,
+      width: 130,
+      render: () => <span style={{ color: 'var(--accent)', font: '600 12px/1 var(--font-ui)' }}>View calls →</span>,
+    },
+  ], [])
+
   const dailyColumns: Column<DailyToolRow>[] = useMemo(() => [
     {
       key: 'date',
@@ -366,6 +473,39 @@ export function ToolsView() {
         />
       </div>
 
+      <Card
+        title="Calls by day"
+        subtitle={`${formatInteger(dailySummary.calls)} calls across ${formatInteger(dailySummary.buckets)} days · select a day to inspect every call`}
+        pad={0}
+      >
+        {dailyLoading && !dailyData ? (
+          <div style={{ padding: 16 }}><Skeleton width="100%" height={180} /></div>
+        ) : dailyError && !dailyData ? (
+          <ErrorState title="Daily tool usage failed to load" message={dailyError} onRetry={requestRefresh} />
+        ) : dailyTotals.length === 0 ? (
+          <EmptyState
+            icon="calendar"
+            title="No tool calls in this range"
+            description="Adjust the time range or check that the selected source records tool events."
+          />
+        ) : (
+          <DataTable
+            columns={dailyTotalColumns}
+            rows={dailyTotals}
+            rowKey={(row) => row.date}
+            onRowClick={(row) => {
+              setSelectedCall(null)
+              setDayCalls([])
+              setDayCallsError(null)
+              setFailedCallDetails(0)
+              setDayCallsLoading(true)
+              setSelectedDay(row)
+            }}
+            dense
+          />
+        )}
+      </Card>
+
       {!summary.empty && failureLeaders.length > 0 && (
         <Card title="Most failed" subtitle="Tools with the most failed invocations in this range">
           {failureLeaders.map((row) => (
@@ -420,8 +560,8 @@ export function ToolsView() {
       )}
 
       <Card
-        title={`Tool calls by ${dailyData?.granularity === 'hour' ? 'hour' : 'day'}`}
-        subtitle={`${formatInteger(dailySummary.calls)} calls across ${formatInteger(dailySummary.buckets)} ${dailyData?.granularity === 'hour' ? 'hours' : 'days'} · most recent first`}
+        title="Tool breakdown by day"
+        subtitle="Aggregated by tool within each date · most recent first"
         action={<SearchInput value={filter} onChange={setFilter} placeholder="Filter tools…" label="Filter daily tools" width={220} />}
         pad={0}
       >
@@ -451,6 +591,189 @@ export function ToolsView() {
           />
         )}
       </Card>
+
+      <ToolCallsDrawer
+        day={selectedDay}
+        calls={dayCalls}
+        loading={dayCallsLoading}
+        error={dayCallsError}
+        failedDetails={failedCallDetails}
+        selectedCall={selectedCall}
+        onSelectCall={setSelectedCall}
+        onBack={() => setSelectedCall(null)}
+        onRetry={() => {
+          setSelectedCall(null)
+          setDayCalls([])
+          setDayCallsError(null)
+          setFailedCallDetails(0)
+          setDayCallsLoading(true)
+          setDayCallsNonce((nonce) => nonce + 1)
+        }}
+        onClose={() => {
+          setSelectedCall(null)
+          setDayCalls([])
+          setDayCallsError(null)
+          setFailedCallDetails(0)
+          setDayCallsLoading(false)
+          setSelectedDay(null)
+        }}
+      />
     </div>
+  )
+}
+
+function toolStatusTone(status: string) {
+  switch (status) {
+    case 'completed': return 'success' as const
+    case 'error': return 'danger' as const
+    case 'running': return 'accent' as const
+    case 'pending': return 'warning' as const
+    default: return 'neutral' as const
+  }
+}
+
+interface ToolCallsDrawerProps {
+  day: DailyToolTotalRow | null
+  calls: ToolCallRow[]
+  loading: boolean
+  error: string | null
+  failedDetails: number
+  selectedCall: ToolCallRow | null
+  onSelectCall: (call: ToolCallRow) => void
+  onBack: () => void
+  onRetry: () => void
+  onClose: () => void
+}
+
+function ToolCallsDrawer({
+  day,
+  calls,
+  loading,
+  error,
+  failedDetails,
+  selectedCall,
+  onSelectCall,
+  onBack,
+  onRetry,
+  onClose,
+}: ToolCallsDrawerProps) {
+  const columns: Column<ToolCallRow>[] = useMemo(() => [
+    {
+      key: 'time',
+      header: 'Time',
+      width: 150,
+      render: (row) => <span style={{ font: '500 11px/1 var(--font-mono)', color: 'var(--fg-secondary)' }}>{formatDateTime(row.timeCreated)}</span>,
+    },
+    {
+      key: 'tool',
+      header: 'Tool',
+      wrap: true,
+      render: (row) => (
+        <span style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
+          <span style={{ font: '600 12px/1.2 var(--font-mono)', color: 'var(--fg-primary)' }}>{row.tool}</span>
+          {row.summary && <span style={{ font: '400 11px/1.3 var(--font-ui)', color: 'var(--fg-faint)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{row.summary}</span>}
+        </span>
+      ),
+    },
+    {
+      key: 'status',
+      header: 'Status',
+      width: 110,
+      render: (row) => <Badge tone={toolStatusTone(row.status)}>{row.status}</Badge>,
+    },
+    {
+      key: 'session',
+      header: 'Session',
+      wrap: true,
+      width: 190,
+      render: (row) => (
+        <span title={row.sessionId} style={{ font: '400 11px/1.3 var(--font-ui)', color: 'var(--fg-secondary)' }}>
+          {row.sessionTitle || row.sessionId.slice(0, 16)}
+        </span>
+      ),
+    },
+  ], [])
+
+  const state = selectedCall?.part.state
+  const duration = state?.time?.start && state.time.end && state.time.end >= state.time.start
+    ? `${((state.time.end - state.time.start) / 1000).toFixed(2)}s`
+    : null
+
+  return (
+    <Drawer
+      open={day !== null}
+      onClose={onClose}
+      width={820}
+      title={selectedCall ? selectedCall.tool : day ? `Tool calls · ${formatShortDate(day.date)}` : 'Tool calls'}
+      subtitle={selectedCall ? `Call ${selectedCall.part.call_id || selectedCall.key}` : day ? `${formatInteger(day.calls)} recorded calls` : undefined}
+    >
+      {selectedCall ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div><Button size="sm" variant="secondary" onClick={onBack}>← Back to day</Button></div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+            <Badge tone={toolStatusTone(selectedCall.status)}>{selectedCall.status}</Badge>
+            <Badge>{selectedCall.sessionTitle || 'Untitled session'}</Badge>
+            {duration && <Badge>{duration}</Badge>}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
+            <CallFact label="Recorded at" value={formatDateTime(selectedCall.timeCreated)} />
+            <CallFact label="Message" value={selectedCall.messageId} />
+            <CallFact label="Session" value={selectedCall.sessionId} />
+          </div>
+
+          {state?.title && <PayloadBlock title="Title" value={state.title} />}
+          {state?.input && Object.keys(state.input).length > 0 && <PayloadBlock title="Input" value={state.input} json />}
+          {state?.output && <PayloadBlock title="Output" value={state.output} />}
+          {state?.error && <PayloadBlock title="Error" value={state.error} danger />}
+          {state?.metadata && Object.keys(state.metadata).length > 0 && <PayloadBlock title="Metadata" value={state.metadata} json />}
+          {state?.truncation?.truncated && (
+            <Notice tone="warning" title="Payload truncated">
+              Large tool content is shortened by the dashboard detail API before it reaches this view.
+            </Notice>
+          )}
+        </div>
+      ) : loading ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <Skeleton width="45%" height={20} />
+          <Skeleton width="100%" height={260} />
+        </div>
+      ) : error ? (
+        <ErrorState title="Tool calls failed to load" message={error} onRetry={onRetry} />
+      ) : calls.length === 0 ? (
+        <EmptyState icon="wrench" title="No call details found" description="The daily aggregate exists, but this source returned no message-level tool parts for the selected date." />
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {day && (calls.length !== day.calls || failedDetails > 0) && (
+            <Notice tone="warning" title="Call detail is incomplete">
+              Loaded {formatInteger(calls.length)} of {formatInteger(day.calls)} aggregated calls.
+              {failedDetails > 0 ? ` ${formatInteger(failedDetails)} message details could not be read.` : ''}
+            </Notice>
+          )}
+          <DataTable columns={columns} rows={calls} rowKey={(row) => row.key} onRowClick={onSelectCall} dense />
+        </div>
+      )}
+    </Drawer>
+  )
+}
+
+function CallFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ background: 'var(--ink-850)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-md)', padding: '10px 12px', minWidth: 0 }}>
+      <div style={{ font: '600 10px/1 var(--font-ui)', letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--fg-muted)' }}>{label}</div>
+      <div title={value} style={{ marginTop: 6, font: '500 11px/1.4 var(--font-mono)', color: 'var(--fg-primary)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{value}</div>
+    </div>
+  )
+}
+
+function PayloadBlock({ title, value, json = false, danger = false }: { title: string; value: unknown; json?: boolean; danger?: boolean }) {
+  const content = json ? JSON.stringify(value, null, 2) : String(value)
+  return (
+    <Card title={title} pad={14}>
+      <pre style={{ margin: 0, font: '400 11px/1.55 var(--font-mono)', color: danger ? 'var(--danger)' : 'var(--fg-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 360, overflow: 'auto' }}>
+        {content}
+      </pre>
+    </Card>
   )
 }

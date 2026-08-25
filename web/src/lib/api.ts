@@ -7,6 +7,7 @@ import type {
   ConfigStats,
   DailyDimensionStats,
   DailyStats,
+  Granularity,
   MessageDetail,
   MessageList,
   ModelStats,
@@ -321,8 +322,10 @@ export function getSessionsWithFilter(
   return request<SessionList>(buildUrl('/api/v1/sessions', period, extraParams, sourceId), { signal })
 }
 
-export function getDailyDimension(dimension: string, period: string, signal?: AbortSignal, sourceId?: SourceID) {
-  return request<DailyDimensionStats>(buildUrl('/api/v1/daily', period, { dimension }, sourceId), { signal })
+export function getDailyDimension(dimension: string, period: string, signal?: AbortSignal, sourceId?: SourceID, granularity?: Granularity) {
+  const params: Record<string, string> = { dimension }
+  if (granularity) params.granularity = granularity
+  return request<DailyDimensionStats>(buildUrl('/api/v1/daily', period, params, sourceId), { signal })
 }
 
 export function getProjectDetail(id: string, period: string, page?: number, limit?: number, signal?: AbortSignal, sourceId?: SourceID) {
