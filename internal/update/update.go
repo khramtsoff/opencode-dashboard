@@ -21,7 +21,7 @@ import (
 
 const (
 	// Repo is the GitHub "owner/name" slug for releases and the installer.
-	Repo = "Andres77872/opencode-dashboard"
+	Repo = "khramtsoff/opencode-dashboard"
 
 	binaryName       = "opencode-dashboard"
 	installScriptURL = "https://raw.githubusercontent.com/" + Repo + "/master/scripts/install.sh"

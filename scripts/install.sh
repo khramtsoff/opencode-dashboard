@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -eu
 
-REPO="${REPO:-Andres77872/opencode-dashboard}"
+REPO="${REPO:-khramtsoff/opencode-dashboard}"
 BINARY_NAME="${BINARY_NAME:-opencode-dashboard}"
 VERSION="${VERSION:-latest}"
 NO_CHECKSUM="${NO_CHECKSUM:-0}"

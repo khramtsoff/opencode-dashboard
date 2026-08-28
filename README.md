@@ -248,7 +248,7 @@ Released binaries need none of the build tooling — only source data on disk.
 Install the latest release binary:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/Andres77872/opencode-dashboard/master/scripts/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/khramtsoff/opencode-dashboard/master/scripts/install.sh | bash
 ```
 
 This fetches a **release binary** from GitHub Releases and installs it to `~/.local/bin`.
@@ -286,7 +286,7 @@ The installer compares the installed version with the target version:
 To install a specific version:
 
 ```bash
-VERSION=v0.1.12 curl -sSL https://raw.githubusercontent.com/Andres77872/opencode-dashboard/master/scripts/install.sh | bash
+VERSION=v0.1.12 curl -sSL https://raw.githubusercontent.com/khramtsoff/opencode-dashboard/master/scripts/install.sh | bash
 ```
 
 ### Updating
@@ -309,7 +309,7 @@ is open). It is bash-only and supported on Linux and macOS.
 ### Build from source
 
 ```bash
-git clone https://github.com/Andres77872/opencode-dashboard.git
+git clone https://github.com/khramtsoff/opencode-dashboard.git
 cd opencode-dashboard
 VERSION=v0.1.12 ./scripts/build.sh
 cp build/opencode-dashboard ~/.local/bin/
