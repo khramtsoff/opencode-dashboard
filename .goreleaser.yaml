@@ -52,5 +52,5 @@ changelog:
 
 release:
   github:
-    owner: Andres77872
+    owner: khramtsoff
     name: opencode-dashboard
